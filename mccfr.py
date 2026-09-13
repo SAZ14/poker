@@ -29,6 +29,31 @@ CFR+ (Tammelin, "Solving Large Imperfect Information Games Using CFR+",
 import random
 import numpy as np
 
+# Performance note
+# ----------------
+# Info sets here have 2-3 actions, so per-node numpy calls cost far more in
+# call overhead than they save in arithmetic. The hot path in `_traverse`
+# therefore uses plain Python lists and floats. The one exception is the
+# dot product for the node utility: on this platform numpy routes it to an
+# OpenBLAS kernel that uses fused multiply-add, whose rounding a plain
+# Python `s*u` sum cannot reproduce. To keep training output bit-identical
+# for a fixed seed, that single call stays as `np.dot`.
+_dot = np.dot
+
+
+def _regret_matching(regret_sum):
+    """Positive-regret-proportional strategy as a Python list. Matches
+    np.maximum(r, 0) / sum elementwise (sequential sum, same as numpy's
+    for fewer than 8 elements)."""
+    pos = [r if r >= 0.0 else 0.0 for r in regret_sum]
+    total = 0.0
+    for p in pos:
+        total += p
+    if total > 0.0:
+        return [p / total for p in pos]
+    n = len(pos)
+    return [1.0 / n] * n
+
 
 class InfoSetNode:
     __slots__ = ("actions", "regret_sum", "strategy_sum")
@@ -36,21 +61,20 @@ class InfoSetNode:
     def __init__(self, actions):
         self.actions = actions
         n = len(actions)
-        self.regret_sum = np.zeros(n)
-        self.strategy_sum = np.zeros(n)
+        self.regret_sum = [0.0] * n    # cumulative counterfactual regret per action
+        self.strategy_sum = [0.0] * n  # accumulated current-strategy weight per action
 
     def current_strategy(self):
-        pos = np.maximum(self.regret_sum, 0.0)
-        total = pos.sum()
-        if total > 0:
-            return pos / total
-        return np.full(len(self.actions), 1.0 / len(self.actions))
+        return np.array(_regret_matching(self.regret_sum))
 
     def average_strategy(self):
-        total = self.strategy_sum.sum()
-        if total > 0:
-            return self.strategy_sum / total
-        return np.full(len(self.actions), 1.0 / len(self.actions))
+        total = 0.0
+        for s in self.strategy_sum:
+            total += s
+        if total > 0.0:
+            return np.array([s / total for s in self.strategy_sum])
+        n = len(self.actions)
+        return np.full(n, 1.0 / n)
 
 
 class MCCFRTrainer:
@@ -71,14 +95,6 @@ class MCCFRTrainer:
         self.iteration = 0  # total iterations trained so far, across train() calls
         self.nodes = {}  # info_set_key -> InfoSetNode
 
-    def _get_node(self, state):
-        key = state.info_set_key()
-        node = self.nodes.get(key)
-        if node is None:
-            node = InfoSetNode(state.legal_actions())
-            self.nodes[key] = node
-        return node
-
     def _traverse(self, state, traversing_player, t):
         """
         Returns the expected utility of `state` to `traversing_player` under
@@ -95,25 +111,48 @@ class MCCFRTrainer:
             state = self.sample_chance(state, self.rng)
             return self._traverse(state, traversing_player, t)
 
-        node = self._get_node(state)
-        strategy = node.current_strategy()
+        key = state.info_set_key()
+        node = self.nodes.get(key)
+        if node is None:
+            node = InfoSetNode(state.legal_actions())
+            self.nodes[key] = node
+
+        regret = node.regret_sum
+        strategy = _regret_matching(regret)
+        n = len(strategy)
 
         if player == traversing_player:
-            action_utils = np.zeros(len(node.actions))
-            for i, a in enumerate(node.actions):
-                action_utils[i] = self._traverse(state.next_state(a), traversing_player, t)
-            node_util = float(np.dot(strategy, action_utils))
-            node.regret_sum += action_utils - node_util
+            action_utils = [self._traverse(state.next_state(a), traversing_player, t)
+                            for a in node.actions]
+            node_util = float(_dot(strategy, action_utils))
+            ssum = node.strategy_sum
             if self.plus:
-                # Regret matching+: floor cumulative regrets at zero.
-                np.maximum(node.regret_sum, 0.0, out=node.regret_sum)
-                # Linear averaging: later iterates count more.
-                node.strategy_sum += t * strategy
+                for i in range(n):
+                    # Regret matching+: floor cumulative regrets at zero.
+                    r = regret[i] + (action_utils[i] - node_util)
+                    regret[i] = r if r >= 0.0 else 0.0
+                    # Linear averaging: later iterates count more.
+                    ssum[i] += t * strategy[i]
             else:
-                node.strategy_sum += strategy
+                for i in range(n):
+                    regret[i] += action_utils[i] - node_util
+                    ssum[i] += strategy[i]
             return node_util
         else:
-            a_idx = self.rng.choices(range(len(node.actions)), weights=strategy, k=1)[0]
+            # Sample one opponent action. This reproduces
+            # random.choices(range(n), weights=strategy, k=1)[0] exactly:
+            # one rng.random() draw scaled by the cumulative total, then a
+            # bisect_right over the cumulative weights capped at n - 1.
+            acc = strategy[0]
+            for i in range(1, n):
+                acc += strategy[i]
+            r = self.rng.random() * (acc + 0.0)
+            hi = n - 1
+            a_idx = 0
+            acc = strategy[0]
+            while a_idx < hi and acc <= r:
+                a_idx += 1
+                acc += strategy[a_idx]
             a = node.actions[a_idx]
             return self._traverse(state.next_state(a), traversing_player, t)
 
