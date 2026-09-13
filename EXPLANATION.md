@@ -54,6 +54,8 @@ The cost is variance. External sampling needs more iterations than vanilla CFR t
 
 `train()` samples a fresh deal each iteration and runs `_traverse` once for each player. The game code is entirely decoupled: `mccfr.py` only needs `is_terminal`, `current_player`, `legal_actions`, `next_state`, `info_set_key`, and `utility`.
 
+`MCCFRTrainer(plus=True)` switches on CFR+ (Tammelin, 2014), which changes two lines of the traversing-player branch. After the regret update, `regret_sum` is clipped at zero elementwise (regret matching+), so an action that accumulated a large negative regret can come back into play as soon as it becomes good, instead of having to climb all the way back up. And the average strategy is accumulated as `strategy_sum += t * σ` rather than `strategy_sum += σ`, so the crude early iterates are down-weighted. Both are exact in the sense that the same convergence theorem still applies, and in practice CFR+ reaches a given exploitability in far fewer iterations. `_traverse` takes the iteration number `t` as a parameter for this reason.
+
 ## 5. Knowing whether it worked: exploitability
 
 You cannot check a poker solver by looking at the strategies, so `exploitability.py` computes the standard convergence metric. For a strategy profile `σ`, compute the best response value `BR_i(σ_{-i})`: the most player `i` could win by playing perfectly against the opponent's fixed strategy. Then

@@ -119,6 +119,25 @@ def test_leduc_mccfr_makes_progress():
     assert expl_late < expl_early * 0.75  # meaningfully better, not just noise
 
 
+def test_leduc_cfr_plus_beats_plain_mccfr():
+    """CFR+ (regret clipping + linear averaging) should reach a lower
+    exploitability than plain MCCFR after the same number of iterations
+    from the same seed."""
+    def make_trainer(plus):
+        return MCCFRTrainer(sample_root=leduc.LeducState.sample_root,
+                            sample_chance=lambda s, rng: s.deal_public_sample(rng),
+                            seed=11, plus=plus)
+
+    results = {}
+    for plus in (False, True):
+        trainer = make_trainer(plus)
+        trainer.train(60_000)
+        table = trainer.average_strategy_table()
+        results[plus], _, _ = exploitability(leduc.LeducState.enumerate_deals, table)
+
+    assert results[True] < results[False]
+
+
 def test_uniform_random_strategy_is_far_from_equilibrium():
     """Sanity check on the exploitability metric itself: a uniform random
     strategy should be clearly more exploitable than a trained one."""

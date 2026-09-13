@@ -10,6 +10,7 @@ See [EXPLANATION.md](EXPLANATION.md) for how and why it works.
 pip install -r requirements.txt
 python3 train.py kuhn  --iterations 300000
 python3 train.py leduc --iterations 300000
+python3 train.py leduc --iterations 300000 --plus   # CFR+ (Tammelin 2014)
 python3 -m pytest test_solver.py -v
 ```
 
