@@ -100,7 +100,7 @@ The code is the minimum that is correct and verifiable. The path to a real solve
 - Card abstraction: in real Hold'em you bucket the ~10^6 possible hand-board combinations into a few thousand strategically similar clusters, then solve the abstract game.
 - Action abstraction: discretize bet sizes (e.g. 0.5x, 1x, 2x pot, all-in). This is what commercial no-limit solvers do.
 - Deep CFR (Brown et al., 2019): replace the regret tables with neural networks so you don't need explicit abstraction.
-- Depth-limited solving and subgame re-solving (Libratus, Pluribus): solve the early streets offline, re-solve the later ones in real time given the actual board.
+- Depth-limited solving and subgame re-solving (Libratus, Pluribus): solve the early streets offline, re-solve the later ones in real time given the actual board. `resolve.py` implements the *unsafe* version for Leduc's flop and measures what it costs: it helps a weak blueprint a lot and makes a strong one several times worse, because a re-solve against a frozen opponent range has no defense against the opponent changing how they reach the subgame. That failure is the reason safe re-solving exists.
 
 ## References
 

@@ -70,6 +70,12 @@ def _full_deck():
     return [r for r in range(RANKS) for _ in range(COPIES)]
 
 
+def legal_actions_for_round_history(h):
+    """Legal actions from a round history string. The returned list is shared
+    module state: treat it as read-only."""
+    return _LEGAL[h]
+
+
 class LeducState:
     __slots__ = ("cards", "public", "round_idx", "round_hists", "contrib",
                  "folded", "deck_remaining", "_h", "_player")

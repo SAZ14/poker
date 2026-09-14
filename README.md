@@ -44,6 +44,26 @@ Leduc Hold'em exploitability, external sampling, seed 0:
 
 CFR+ and DCFR are close to each other and roughly 5x better than plain regret matching at 500k iterations. Plain is also visibly non-monotone: with uniform averaging the sampling noise of external sampling is not damped, so more iterations can temporarily make the average strategy worse. Regenerate the plot with `python3 plots/convergence.py` (add `--replot` to redraw from the saved JSON without retraining).
 
+## Subgame re-solving
+
+`resolve.py` keeps the blueprint for the preflop and re-solves each flop subgame on arrival, using the blueprint's reach probabilities as the subgame's root distribution and vanilla CFR+ as the solver. A subgame is one (preflop line, public card) pair, 15 in all; together they own 270 of Leduc's 288 information sets.
+
+This is **unsafe** re-solving, and the numbers show exactly why that word is there:
+
+| blueprint iterations | blueprint | re-solved | change |
+|---|---|---|---|
+| 5,000 | 0.26406 | 0.12080 | −54.3% |
+| 20,000 | 0.14650 | 0.10040 | −31.5% |
+| 100,000 | 0.06370 | 0.13924 | +118.6% |
+| 500,000 | 0.02914 | 0.13048 | +347.7% |
+
+Re-solving rescues a weak blueprint and wrecks a strong one. Notice that the re-solved column barely moves (0.10 to 0.14) while the blueprint column improves by a factor of nine: the re-solve is a best response to a *frozen* opponent range, so its quality is capped by how much the opponent gains by deviating preflop to reach the subgame with a different mix of hands, no matter how good the blueprint was. Safe re-solving (Burch, Johanson & Bowling 2014) removes that cap by constraining the re-solve to concede no more than the blueprint already did; it is not implemented here. See the module docstring in `resolve.py` for the full argument.
+
+```bash
+python3 resolve.py --blueprint-iterations 20000   # one comparison
+python3 resolve.py --sweep                        # the table above
+```
+
 ## Layout
 
 | File | What it is |
@@ -55,6 +75,7 @@ CFR+ and DCFR are close to each other and roughly 5x better than plain regret ma
 | `train.py` | CLI: train, report exploitability over time, print the average strategy, `--save` it as JSON |
 | `strategy.py` | Save/load strategy tables as JSON; print a Leduc strategy as a readable poker chart |
 | `play.py` | Interactive CLI: play heads-up Leduc against a saved strategy, seats alternate, chips tracked |
+| `resolve.py` | Unsafe subgame re-solving of Leduc's flop against the blueprint's range, with a measurement CLI |
 | `plots/convergence.py` | Measures and plots exploitability vs iterations for all three variants |
 | `test_solver.py` | Game-logic and convergence tests against theory |
 

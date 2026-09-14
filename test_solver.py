@@ -19,6 +19,15 @@ from mccfr import MCCFRTrainer, OutcomeSamplingTrainer
 from exploitability import exploitability, best_response_value
 from strategy import save_strategy, load_strategy, leduc_summary, parse_leduc_key
 import play
+import resolve
+
+
+def _quick_leduc_blueprint(iterations, seed=0, variant="plus"):
+    trainer = MCCFRTrainer(sample_root=leduc.LeducState.sample_root,
+                           sample_chance=lambda s, rng: s.deal_public_sample(rng),
+                           seed=seed, variant=variant)
+    trainer.train(iterations)
+    return trainer.average_strategy_table()
 
 
 # ---------------------------------------------------------------------------
@@ -265,6 +274,102 @@ def test_leduc_king_rarely_folds_preflop_facing_bet():
     for hist in ("r", "cr", "rr", "crr"):  # every preflop spot facing a bet/raise
         probs = table[f"{king}|-|{hist}/"]
         assert probs["f"] < 0.05, (hist, probs)
+
+
+# ---------------------------------------------------------------------------
+# Subgame re-solving (Leduc flop)
+# ---------------------------------------------------------------------------
+
+def test_preflop_lines_match_the_games_round_over_set():
+    assert set(resolve.PREFLOP_LINES) == set(leduc._ROUND_OVER)
+
+
+def test_deal_probabilities_sum_to_one():
+    total = sum(resolve.deal_probability(a, b, c)
+                for a in range(3) for b in range(3) for c in range(3))
+    assert abs(total - 1.0) < 1e-12
+    # three of a rank is impossible with two copies of each
+    assert resolve.deal_probability(0, 0, 0) == 0.0
+
+
+def test_flop_root_state_carries_the_preflop_pot():
+    expected = {"cc": 2, "rc": 6, "crc": 6, "rrc": 10, "crrc": 10}
+    for hist, pot in expected.items():
+        state = resolve.flop_root_state(0, 1, 2, hist)
+        assert sum(state.contrib) == pot
+        assert state.contrib[0] == state.contrib[1]   # both called
+        assert state.current_player() == 0            # P0 acts first on the flop
+        assert state.round_idx == 1 and state.public == 2
+
+
+def test_subgame_root_distribution_normalizes_and_respects_the_deck():
+    dist = resolve.subgame_root_distribution({}, "cc", 0)  # uniform blueprint
+    assert abs(sum(p for _, _, p in dist) - 1.0) < 1e-12
+    pairs = {(c0, c1) for c0, c1, _ in dist}
+    # board holds one of the two Jacks, so both players cannot also hold one
+    assert (0, 0) not in pairs
+    # a pair of ranks that avoids the board card is twice as likely as one using it
+    weight = {(c0, c1): p for c0, c1, p in dist}
+    assert abs(weight[(1, 2)] - 2 * weight[(0, 1)]) < 1e-12
+
+
+def test_preflop_reach_multiplies_only_the_players_own_actions():
+    # P0 bets then calls; P1 raises. Under a blueprint that always raises/bets,
+    # P0's reach for "rrc" is P(bet) * P(call) and P1's is P(raise).
+    blueprint = {
+        "2|-|/": {"c": 0.0, "r": 1.0},
+        "2|-|r/": {"c": 0.0, "f": 0.0, "r": 1.0},
+        "2|-|rr/": {"c": 0.25, "f": 0.75},
+    }
+    assert resolve.preflop_reach(blueprint, 0, 2, "rrc") == 0.25
+    assert resolve.preflop_reach(blueprint, 1, 2, "rrc") == 1.0
+
+
+def test_resolved_subgame_returns_valid_distributions():
+    blueprint = _quick_leduc_blueprint(3_000)
+    dist = resolve.subgame_root_distribution(blueprint, "rc", 1)
+    table = resolve.resolve_subgame(dist, "rc", 1, iterations=50)
+    assert table
+    for key, probs in table.items():
+        assert key.split("|")[1] == "1"          # right board card
+        assert key.split("|")[2].split("/")[0] == "rc"   # right preflop line
+        assert abs(sum(probs.values()) - 1.0) < 1e-9
+        assert all(p >= 0.0 for p in probs.values())
+
+
+def test_resolve_all_replaces_every_flop_info_set_and_keeps_preflop():
+    blueprint = _quick_leduc_blueprint(5_000)
+    combined, stats = resolve.resolve_all(blueprint, iterations=50)
+    assert stats["resolved"] == 15 and stats["skipped"] == 0   # 5 lines x 3 boards
+    assert set(combined) == set(blueprint)
+    preflop = [k for k in blueprint if k.split("|")[1] == "-"]
+    assert len(preflop) == 18
+    for key in preflop:
+        assert combined[key] == blueprint[key]     # preflop untouched
+    flop = [k for k in blueprint if k.split("|")[1] != "-"]
+    assert len(flop) == 270
+    assert stats["info_sets_replaced"] == 270
+
+
+def test_unsafe_resolving_improves_a_weak_blueprint():
+    blueprint = _quick_leduc_blueprint(5_000)
+    before, _, _ = exploitability(leduc.LeducState.enumerate_deals, blueprint)
+    combined, _ = resolve.resolve_all(blueprint, iterations=500)
+    after, _, _ = exploitability(leduc.LeducState.enumerate_deals, combined)
+    assert after < before * 0.75
+
+
+def test_unsafe_resolving_can_hurt_a_strong_blueprint():
+    """The defining failure of UNSAFE re-solving, pinned as a test: the
+    re-solve is a best response to the blueprint's frozen range, so once the
+    blueprint is good enough, replacing its flop play makes the whole strategy
+    more exploitable rather than less. Safe re-solving is what fixes this."""
+    blueprint = _quick_leduc_blueprint(100_000)
+    before, _, _ = exploitability(leduc.LeducState.enumerate_deals, blueprint)
+    combined, _ = resolve.resolve_all(blueprint, iterations=500)
+    after, _, _ = exploitability(leduc.LeducState.enumerate_deals, combined)
+    assert before < 0.08        # the blueprint really is decent
+    assert after > before       # and re-solving made it worse
 
 
 # ---------------------------------------------------------------------------
