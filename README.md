@@ -60,17 +60,23 @@ python3 bench.py         # 1M iterations on both backends
 
 | variant | pure Python | Rust | speedup |
 |---|---|---|---|
-| `plain` | 83.63 s | 0.61 s | **137x** |
-| `plus` | 82.03 s | 0.67 s | **123x** |
-| `dcfr` | 100.84 s | 0.98 s | **103x** |
+| `plain` | 75.43 s | 0.68 s | **111x** |
+| `plus` | 74.66 s | 0.64 s | **117x** |
+| `dcfr` | 89.30 s | 0.92 s | **97x** |
 
-That is 12k iterations/second in Python against 1.5M/second in Rust. The test suite drops from 71 s to 28 s as a side effect.
+That is 13k iterations/second in Python against 1.5M/second in Rust. The test suite drops from 60 s to 28 s as a side effect.
 
 **The results are bit-identical, not merely close.** Same seed in, same floats out, verified field by field across all three variants and across split `train()` calls. Three things are needed for that, and each is done deliberately:
 
 - **The RNG stream is shared, not re-seeded.** Python hands `rng.getstate()` to Rust and takes the state back afterwards, so `self.rng` stays continuous for callers. Rust reimplements CPython's Mersenne Twister draws (`random()`, `getrandbits`, `_randbelow`, `shuffle`, `choice`) bit for bit.
-- **The dot product uses a fused multiply-add chain**, because `np.dot` routes to an OpenBLAS kernel that does, and a plain `sum(s*u)` rounds differently.
+- **Only exactly-specified float operations are used.** The node utility is a plain sequential sum of products, never a fused multiply-add and never `np.dot`. See the note below on why.
 - **Accumulation order is preserved** in regret matching, the opponent-sampling cumulative sums, and the regret and strategy updates, since float addition is not associative.
+
+### Why the hot loop avoids `np.dot`
+
+The node utility used to be computed with `np.dot`. That turns out to make training results **depend on the machine**: numpy dispatches the dot product to an OpenBLAS kernel chosen from the CPU's features at runtime, and that kernel contracts the multiply and add into a fused multiply-add on some hosts but not others. FMA rounds once where separate operations round twice, so the two disagree in the last bit, and in a solver whose next sampled action depends on those bits the trajectories then diverge completely.
+
+This was not theoretical. Two CI runners on the same commit disagreed about the same seed, one passing and one failing the Python-versus-Rust comparison. The fix was to drop `np.dot` in favour of a sequential sum, which uses only IEEE-754 multiply and add, both exactly specified, and so gives identical bits on every conforming machine and in either language. It is also about 10% faster at this size, since a numpy call on a 2-3 element array is mostly call overhead. `test_training_is_reproducible_across_machines` pins a fixed seed to literal expected floats so that any reintroduction of a contracted or hardware-dispatched float operation fails loudly.
 
 The native loop is used only when it is a faithful substitute: `sample_root` must be Leduc's, the chance hook is *behaviourally probed* against `deal_public_sample` (same card dealt, same RNG draws consumed), and subclasses such as `OutcomeSamplingTrainer` are excluded because they traverse differently. Anything else silently falls back. Pass `backend="python"` to force the fallback or `backend="rust"` to require the native path.
 
@@ -82,10 +88,10 @@ This is **unsafe** re-solving, and the numbers show exactly why that word is the
 
 | blueprint iterations | blueprint | re-solved | change |
 |---|---|---|---|
-| 5,000 | 0.26406 | 0.12080 | −54.3% |
+| 5,000 | 0.26406 | 0.12083 | −54.2% |
 | 20,000 | 0.14650 | 0.10040 | −31.5% |
-| 100,000 | 0.06370 | 0.13924 | +118.6% |
-| 500,000 | 0.02914 | 0.13048 | +347.7% |
+| 100,000 | 0.06370 | 0.13925 | +118.6% |
+| 500,000 | 0.02914 | 0.13051 | +347.8% |
 
 Re-solving rescues a weak blueprint and wrecks a strong one. Notice that the re-solved column barely moves (0.10 to 0.14) while the blueprint column improves by a factor of nine: the re-solve is a best response to a *frozen* opponent range, so its quality is capped by how much the opponent gains by deviating preflop to reach the subgame with a different mix of hands, no matter how good the blueprint was. Safe re-solving (Burch, Johanson & Bowling 2014) removes that cap by constraining the re-solve to concede no more than the blueprint already did; it is not implemented here. See the module docstring in `resolve.py` for the full argument.
 

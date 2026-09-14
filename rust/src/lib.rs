@@ -12,10 +12,13 @@
 //!    draws themselves (`random()`, `_randbelow`, `shuffle`, `choice`) are
 //!    reimplemented to match CPython's exact bit manipulation.
 //!
-//! 2. **The dot product.** `mccfr.py` computes the node utility with `np.dot`,
-//!    which on this platform routes to an OpenBLAS kernel that uses fused
-//!    multiply-add. A plain `sum(s*u)` does not round the same way, so the
-//!    equivalent FMA chain (`mul_add`) is used here.
+//! 2. **The dot product is a plain sequential sum**, never `mul_add`. This
+//!    matters: an FMA contracts the multiply and add into one rounding, which
+//!    gives a different result from separate IEEE-754 multiply and add. The
+//!    Python side avoids `np.dot` for the same reason -- OpenBLAS picks its
+//!    kernel from the CPU at runtime, so it fuses on some machines and not
+//!    others. Using only exactly-specified multiply and add makes the result
+//!    identical on every conforming machine, in both languages.
 //!
 //! 3. **Operation order.** Regret matching, the cumulative sums used for
 //!    opponent sampling, and the regret/strategy updates all accumulate in the
@@ -416,10 +419,11 @@ impl LeducTrainer {
                 let ns = next_state(st, LEGAL[hist_id][i], hist_id);
                 utils[i] = self.traverse(&ns, traversing, t);
             }
-            // np.dot reproduced: OpenBLAS uses a fused multiply-add chain here.
+            // Separate multiply and add, matching the Python exactly. Do NOT
+            // use mul_add here: fusing changes the rounding.
             let mut node_util = 0.0f64;
             for i in 0..n {
-                node_util = strategy[i].mul_add(utils[i], node_util);
+                node_util += strategy[i] * utils[i];
             }
 
             match self.variant {

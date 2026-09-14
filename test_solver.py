@@ -293,6 +293,34 @@ def _leduc_trainer(backend, variant="plus", seed=3):
                         seed=seed, variant=variant, backend=backend)
 
 
+def test_training_is_reproducible_across_machines():
+    """
+    Golden values: a fixed seed must produce exactly these floats on any
+    IEEE-754 machine, in either backend.
+
+    This guards a real bug that CI caught. The node utility used to be
+    computed with `np.dot`, which numpy dispatches to an OpenBLAS kernel
+    selected from the CPU at runtime; it fuses the multiply and add on some
+    machines and not on others, and the two round differently. Two identical
+    CI runners disagreed about this seed. The hot loop now uses only plain
+    IEEE-754 multiply and add, which are exactly specified, so if this test
+    ever fails again something has reintroduced a contracted or
+    hardware-dispatched float operation.
+    """
+    trainer = MCCFRTrainer(sample_root=leduc.LeducState.sample_root,
+                           sample_chance=lambda s, rng: s.deal_public_sample(rng),
+                           seed=12345, variant="plus")
+    trainer.train(3_000)
+    table = trainer.average_strategy_table()
+    assert len(trainer.nodes) == 288
+    assert table["2|-|/"] == {
+        "c": 0.3160416988924218, "r": 0.6839583011075783}
+    assert table["0|-|r/"] == {
+        "c": 0.37993138182202757, "f": 0.49243377865942783, "r": 0.12763483951854462}
+    assert table["1|1|rc/cr"] == {
+        "c": 0.024916924967188853, "f": 0.005556951774594398, "r": 0.9695261232582167}
+
+
 @requires_native
 @pytest.mark.parametrize("variant", ["plain", "plus", "dcfr"])
 def test_native_backend_is_bit_identical_to_python(variant):

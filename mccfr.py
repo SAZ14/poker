@@ -106,16 +106,21 @@ def _is_standard_leduc(sample_root, sample_chance):
                 return False
     return True
 
-# Performance note
-# ----------------
+# Performance and reproducibility note
+# ------------------------------------
 # Info sets here have 2-3 actions, so per-node numpy calls cost far more in
 # call overhead than they save in arithmetic. The hot path in `_traverse`
-# therefore uses plain Python lists and floats. The one exception is the
-# dot product for the node utility: on this platform numpy routes it to an
-# OpenBLAS kernel that uses fused multiply-add, whose rounding a plain
-# Python `s*u` sum cannot reproduce. To keep training output bit-identical
-# for a fixed seed, that single call stays as `np.dot`.
-_dot = np.dot
+# therefore uses plain Python lists and floats throughout.
+#
+# The node utility deliberately does NOT use `np.dot`. numpy dispatches it to
+# an OpenBLAS kernel chosen from the CPU's features at runtime, so on some
+# machines it contracts the products into fused multiply-adds and on others it
+# does not. The two round differently, which made training output depend on the
+# hardware it ran on -- two identical CI runners disagreed about a fixed seed.
+# A sequential sum of products uses only IEEE-754 multiply and add, both exactly
+# specified, so it gives the same bits on every conforming machine and in any
+# language. That is what makes the native Rust loop able to match exactly. It is
+# also faster than np.dot at this size.
 
 
 def _regret_matching(regret_sum):
@@ -310,7 +315,10 @@ class MCCFRTrainer:
         if player == traversing_player:
             action_utils = [self._traverse(state.next_state(a), traversing_player, t)
                             for a in node.actions]
-            node_util = float(_dot(strategy, action_utils))
+            # Sequential, not np.dot: see the reproducibility note at the top.
+            node_util = 0.0
+            for i in range(n):
+                node_util += strategy[i] * action_utils[i]
             ssum = node.strategy_sum
             if self.plus:
                 for i in range(n):
