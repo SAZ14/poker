@@ -17,6 +17,7 @@ import kuhn
 import leduc
 from mccfr import MCCFRTrainer
 from exploitability import exploitability, best_response_value
+from strategy import save_strategy, load_strategy, leduc_summary, parse_leduc_key
 
 
 # ---------------------------------------------------------------------------
@@ -136,6 +137,55 @@ def test_leduc_cfr_plus_beats_plain_mccfr():
         results[plus], _, _ = exploitability(leduc.LeducState.enumerate_deals, table)
 
     assert results[True] < results[False]
+
+
+def test_leduc_king_rarely_folds_preflop_facing_bet():
+    """Poker sanity check on the learned strategy: holding the best card
+    preflop and facing a bet, folding should be (almost) never right."""
+    trainer = MCCFRTrainer(sample_root=leduc.LeducState.sample_root,
+                            sample_chance=lambda s, rng: s.deal_public_sample(rng),
+                            seed=5, plus=True)
+    trainer.train(60_000)
+    table = trainer.average_strategy_table()
+    king = 2
+    for hist in ("r", "cr", "rr", "crr"):  # every preflop spot facing a bet/raise
+        probs = table[f"{king}|-|{hist}/"]
+        assert probs["f"] < 0.05, (hist, probs)
+
+
+# ---------------------------------------------------------------------------
+# Strategy persistence and summary
+# ---------------------------------------------------------------------------
+
+def test_save_load_strategy_roundtrip(tmp_path):
+    trainer = MCCFRTrainer(sample_root=kuhn.KuhnState.sample_root, seed=1)
+    trainer.train(2_000)
+    table = trainer.average_strategy_table()
+    path = tmp_path / "kuhn.json"
+    save_strategy(table, path)
+    assert load_strategy(path) == table
+
+
+def test_leduc_summary_names_actions_by_situation():
+    table = {
+        "2|-|/": {"c": 0.25, "r": 0.75},           # K preflop, first to act
+        "2|-|r/": {"c": 0.6, "r": 0.4, "f": 0.0},  # K preflop, facing a bet
+        "0|1|cc/": {"c": 1.0, "r": 0.0},           # J on a Q board after check-check
+    }
+    text = leduc_summary(table)
+    assert "Private card: K" in text
+    assert "P0 first to act" in text
+    assert "P1 facing a bet" in text
+    assert "Flop, board Q" in text
+    assert "after check-check:" in text
+    # facing a bet: fold column populated; first to act: fold column blank
+    facing = next(l for l in text.splitlines() if "P1 facing a bet" in l)
+    opening = next(l for l in text.splitlines() if "P0 first to act" in l)
+    assert text.index("P0 first to act") < text.index("Flop, board Q")  # preflop block comes first
+    assert " 60.0%   40.0%    0.0%" in facing
+    assert "25.0%   75.0%       -       -       -" in opening
+    assert parse_leduc_key("2|1|rc/cr") == (2, 1, "rc", "cr")
+    assert parse_leduc_key("0|-|c/") == (0, None, "c", "")
 
 
 def test_uniform_random_strategy_is_far_from_equilibrium():

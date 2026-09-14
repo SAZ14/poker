@@ -5,6 +5,8 @@ Usage:
     python3 train.py kuhn   --iterations 100000
     python3 train.py leduc  --iterations 200000
     python3 train.py leduc  --iterations 200000 --plus   # CFR+ updates
+    python3 train.py leduc  --iterations 500000 --plus --save leduc.json
+    python3 strategy.py leduc.json                        # readable chart
 """
 import argparse
 import time
@@ -13,6 +15,7 @@ import kuhn
 import leduc
 from mccfr import MCCFRTrainer
 from exploitability import exploitability
+from strategy import save_strategy
 
 
 def run_kuhn(iterations, report_every, seed, plus=False):
@@ -71,11 +74,17 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--plus", action="store_true",
                         help="use CFR+ (regret clipping + linear strategy averaging)")
+    parser.add_argument("--save", metavar="PATH", default=None,
+                        help="write the final average strategy to PATH as JSON")
     args = parser.parse_args()
 
     report_every = args.report_every or max(1, args.iterations // 10)
 
     if args.game == "kuhn":
-        run_kuhn(args.iterations, report_every, args.seed, plus=args.plus)
+        table, _ = run_kuhn(args.iterations, report_every, args.seed, plus=args.plus)
     else:
-        run_leduc(args.iterations, report_every, args.seed, plus=args.plus)
+        table, _ = run_leduc(args.iterations, report_every, args.seed, plus=args.plus)
+
+    if args.save:
+        save_strategy(table, args.save)
+        print(f"Saved average strategy ({len(table)} info sets) to {args.save}")

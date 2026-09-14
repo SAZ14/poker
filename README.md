@@ -11,6 +11,8 @@ pip install -r requirements.txt
 python3 train.py kuhn  --iterations 300000
 python3 train.py leduc --iterations 300000
 python3 train.py leduc --iterations 300000 --plus   # CFR+ (Tammelin 2014)
+python3 train.py leduc --iterations 500000 --plus --save leduc.json
+python3 strategy.py leduc.json                      # readable poker chart
 python3 -m pytest test_solver.py -v
 ```
 
@@ -24,7 +26,8 @@ Kuhn converges to the known Nash value of -1/18 for player 0 in a few seconds.
 | `kuhn.py` | Kuhn poker game tree (3 cards, one betting round) |
 | `leduc.py` | Leduc Hold'em game tree (6 cards, two rounds, public card, raise cap) |
 | `exploitability.py` | Exact best-response computation; the convergence metric |
-| `train.py` | CLI: train, report exploitability over time, print the average strategy |
+| `train.py` | CLI: train, report exploitability over time, print the average strategy, `--save` it as JSON |
+| `strategy.py` | Save/load strategy tables as JSON; print a Leduc strategy as a readable poker chart |
 | `test_solver.py` | Game-logic and convergence tests against theory |
 
 ## Adding a game
