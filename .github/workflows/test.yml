@@ -17,3 +17,34 @@ jobs:
 
       - name: Install dependencies and run tests
         run: pip install -r requirements.txt && python -m pytest test_solver.py -v
+
+  # The Rust module is optional: the job above proves the pure-Python path still
+  # passes everything without it. This one builds it and re-runs the same suite,
+  # which additionally exercises the native backend and its bit-identity checks.
+  test-native:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('rust/Cargo.toml') }}
+
+      - name: Build the native module
+        run: ./build_rust.sh
+
+      - name: Install dependencies and run tests
+        run: pip install -r requirements.txt && python -m pytest test_solver.py -v

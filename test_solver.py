@@ -277,6 +277,105 @@ def test_leduc_king_rarely_folds_preflop_facing_bet():
 
 
 # ---------------------------------------------------------------------------
+# Native (Rust) backend
+# ---------------------------------------------------------------------------
+
+import pytest
+from mccfr import native_available
+
+requires_native = pytest.mark.skipif(not native_available(),
+                                     reason="mccfr_rs not built (run ./build_rust.sh)")
+
+
+def _leduc_trainer(backend, variant="plus", seed=3):
+    return MCCFRTrainer(sample_root=leduc.LeducState.sample_root,
+                        sample_chance=lambda s, rng: s.deal_public_sample(rng),
+                        seed=seed, variant=variant, backend=backend)
+
+
+@requires_native
+@pytest.mark.parametrize("variant", ["plain", "plus", "dcfr"])
+def test_native_backend_is_bit_identical_to_python(variant):
+    """The whole point of the port: same seed, same numbers, to the last bit."""
+    py = _leduc_trainer("python", variant)
+    rs = _leduc_trainer("rust", variant)
+    assert py.backend == "python" and rs.backend == "rust"
+    py.train(8_000)
+    rs.train(8_000)
+
+    assert set(py.nodes) == set(rs.nodes)
+    for key, node in py.nodes.items():
+        other = rs.nodes[key]
+        assert node.actions == other.actions
+        assert node.regret_sum == other.regret_sum
+        assert node.strategy_sum == other.strategy_sum
+    assert py.average_strategy_table() == rs.average_strategy_table()
+    assert py.iteration == rs.iteration
+    assert py.rng.getstate() == rs.rng.getstate()   # RNG stream stays in lockstep
+
+
+@requires_native
+def test_native_backend_matches_across_split_train_calls():
+    """Continuing training must be equivalent to one longer run, on both
+    backends -- this is what CFR+'s linear weighting and DCFR's lazy discount
+    depend on."""
+    py = _leduc_trainer("python", "dcfr")
+    rs = _leduc_trainer("rust", "dcfr")
+    for chunk in (1_000, 2_500, 4_000):
+        py.train(chunk)
+        rs.train(chunk)
+    assert py.average_strategy_table() == rs.average_strategy_table()
+    assert py.iteration == rs.iteration == 7_500
+
+
+@requires_native
+def test_native_backend_reports_on_the_same_iterations():
+    seen = {"python": [], "rust": []}
+    for backend in ("python", "rust"):
+        trainer = _leduc_trainer(backend)
+        trainer.train(2_500, report_every=1_000,
+                      on_report=lambda t, b=backend: seen[b].append(t))
+    assert seen["python"] == seen["rust"] == [1_000, 2_000]
+
+
+@requires_native
+def test_native_backend_is_selected_automatically_for_leduc_only():
+    assert _leduc_trainer("auto").backend == "rust"
+    # Kuhn has no native loop
+    assert MCCFRTrainer(sample_root=kuhn.KuhnState.sample_root).backend == "python"
+    # a non-standard chance hook must not be silently replaced by Leduc's
+    odd = MCCFRTrainer(sample_root=leduc.LeducState.sample_root,
+                       sample_chance=lambda s, rng: s.with_public(s.deck_remaining[0]))
+    assert odd.backend == "python"
+    # outcome sampling traverses differently, so it never uses the native loop
+    outcome = OutcomeSamplingTrainer(sample_root=leduc.LeducState.sample_root,
+                                     sample_chance=lambda s, rng: s.deal_public_sample(rng))
+    assert outcome.backend == "python"
+
+
+@requires_native
+def test_backend_rust_raises_when_it_cannot_be_used():
+    with pytest.raises(RuntimeError):
+        MCCFRTrainer(sample_root=kuhn.KuhnState.sample_root, backend="rust")
+
+
+def test_backend_argument_is_validated():
+    with pytest.raises(ValueError):
+        MCCFRTrainer(sample_root=kuhn.KuhnState.sample_root, backend="c++")
+
+
+def test_python_backend_always_works_without_the_extension():
+    """The extension is optional: forcing the Python backend must produce a
+    working trainer whether or not mccfr_rs was built."""
+    trainer = _leduc_trainer("python")
+    trainer.train(2_000)
+    assert trainer.backend == "python"
+    assert len(trainer.nodes) > 0
+    table = trainer.average_strategy_table()
+    assert all(abs(sum(p.values()) - 1.0) < 1e-9 for p in table.values())
+
+
+# ---------------------------------------------------------------------------
 # Subgame re-solving (Leduc flop)
 # ---------------------------------------------------------------------------
 

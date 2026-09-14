@@ -17,6 +17,9 @@ python3 train.py leduc --iterations 500000 --plus --save leduc.json
 python3 strategy.py leduc.json                      # readable poker chart
 python3 play.py --strategy leduc.json               # play heads-up against it
 python3 -m pytest test_solver.py -v
+
+./build_rust.sh                                     # optional: ~120x faster Leduc
+python3 bench.py                                    # before/after numbers
 ```
 
 Kuhn converges to the known Nash value of -1/18 for player 0 in a few seconds.
@@ -43,6 +46,33 @@ Leduc Hold'em exploitability, external sampling, seed 0:
 ![Leduc convergence: exploitability vs iterations, log-log, for plain, CFR+ and DCFR](plots/convergence.png)
 
 CFR+ and DCFR are close to each other and roughly 5x better than plain regret matching at 500k iterations. Plain is also visibly non-monotone: with uniform averaging the sampling noise of external sampling is not damped, so more iterations can temporarily make the average strategy worse. Regenerate the plot with `python3 plots/convergence.py` (add `--replot` to redraw from the saved JSON without retraining).
+
+## Native acceleration
+
+The Leduc training loop is also implemented in Rust (`rust/src/lib.rs`, exposed through PyO3). It is **optional**: without it everything runs in pure Python, and with it `MCCFRTrainer` picks it up automatically for standard Leduc. The public interface does not change.
+
+```bash
+./build_rust.sh          # needs a Rust toolchain; drops mccfr_rs.so next to mccfr.py
+python3 bench.py         # 1M iterations on both backends
+```
+
+1,000,000 Leduc iterations, external sampling, seed 0, one core of a Xeon @ 2.10GHz:
+
+| variant | pure Python | Rust | speedup |
+|---|---|---|---|
+| `plain` | 83.63 s | 0.61 s | **137x** |
+| `plus` | 82.03 s | 0.67 s | **123x** |
+| `dcfr` | 100.84 s | 0.98 s | **103x** |
+
+That is 12k iterations/second in Python against 1.5M/second in Rust. The test suite drops from 71 s to 28 s as a side effect.
+
+**The results are bit-identical, not merely close.** Same seed in, same floats out, verified field by field across all three variants and across split `train()` calls. Three things are needed for that, and each is done deliberately:
+
+- **The RNG stream is shared, not re-seeded.** Python hands `rng.getstate()` to Rust and takes the state back afterwards, so `self.rng` stays continuous for callers. Rust reimplements CPython's Mersenne Twister draws (`random()`, `getrandbits`, `_randbelow`, `shuffle`, `choice`) bit for bit.
+- **The dot product uses a fused multiply-add chain**, because `np.dot` routes to an OpenBLAS kernel that does, and a plain `sum(s*u)` rounds differently.
+- **Accumulation order is preserved** in regret matching, the opponent-sampling cumulative sums, and the regret and strategy updates, since float addition is not associative.
+
+The native loop is used only when it is a faithful substitute: `sample_root` must be Leduc's, the chance hook is *behaviourally probed* against `deal_public_sample` (same card dealt, same RNG draws consumed), and subclasses such as `OutcomeSamplingTrainer` are excluded because they traverse differently. Anything else silently falls back. Pass `backend="python"` to force the fallback or `backend="rust"` to require the native path.
 
 ## Subgame re-solving
 
@@ -76,6 +106,8 @@ python3 resolve.py --sweep                        # the table above
 | `strategy.py` | Save/load strategy tables as JSON; print a Leduc strategy as a readable poker chart |
 | `play.py` | Interactive CLI: play heads-up Leduc against a saved strategy, seats alternate, chips tracked |
 | `resolve.py` | Unsafe subgame re-solving of Leduc's flop against the blueprint's range, with a measurement CLI |
+| `rust/` | Optional PyO3 extension: the Leduc loop in Rust, bit-identical and ~120x faster (`./build_rust.sh`) |
+| `bench.py` | Times both backends on the same workload and checks they agree exactly |
 | `plots/convergence.py` | Measures and plots exploitability vs iterations for all three variants |
 | `test_solver.py` | Game-logic and convergence tests against theory |
 

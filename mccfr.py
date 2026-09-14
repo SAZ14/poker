@@ -56,6 +56,56 @@ import numpy as np
 
 VARIANTS = ("plain", "plus", "dcfr")
 
+# Optional native acceleration for Leduc. Build it with ./build_rust.sh; without
+# it everything below runs in pure Python and produces the same numbers, just
+# slower. See rust/src/lib.rs for what "the same numbers" means here: the native
+# loop reproduces this module's RNG stream, dot-product rounding and update
+# order exactly, so results are bit-identical for a given seed.
+try:
+    import mccfr_rs as _rs
+except ImportError:  # pragma: no cover - depends on whether the build was run
+    _rs = None
+
+_VARIANT_CODES = {"plain": 0, "plus": 1, "dcfr": 2}
+_PREFLOP_LINES_PROBE = ("cc", "rc", "crc", "rrc", "crrc")
+
+
+def native_available():
+    """True if the Rust acceleration module was built and imported."""
+    return _rs is not None
+
+
+def _is_standard_leduc(sample_root, sample_chance):
+    """
+    Whether the native Leduc loop is a faithful stand-in for these hooks.
+
+    The root check is identity against LeducState.sample_root. The chance hook
+    cannot be identity-checked (callers normally pass a fresh lambda), so it is
+    probed instead: on a state from every preflop line, the supplied hook must
+    deal the same public card *and* consume the same RNG draws as
+    LeducState.deal_public_sample. Anything else falls back to Python.
+    """
+    import leduc as _leduc
+
+    if sample_root is not _leduc.LeducState.sample_root or sample_chance is None:
+        return False
+    for line in _PREFLOP_LINES_PROBE:
+        for seed in range(4):
+            state = _leduc.LeducState.sample_root(random.Random(991 + seed))
+            for action in line:
+                state = state.next_state(action)
+            if state.current_player() != "CHANCE":
+                return False
+            mine, theirs = random.Random(seed), random.Random(seed)
+            try:
+                got = sample_chance(state, mine)
+            except Exception:
+                return False
+            want = state.deal_public_sample(theirs)
+            if got.public != want.public or mine.getstate() != theirs.getstate():
+                return False
+    return True
+
 # Performance note
 # ----------------
 # Info sets here have 2-3 actions, so per-node numpy calls cost far more in
@@ -107,7 +157,7 @@ class InfoSetNode:
 
 class MCCFRTrainer:
     def __init__(self, sample_root, sample_chance=None, seed=0, plus=False,
-                 variant=None, alpha=1.5, beta=0.0, gamma=2.0):
+                 variant=None, alpha=1.5, beta=0.0, gamma=2.0, backend="auto"):
         """
         sample_root:   () -> initial game state (handles the initial deal)
         sample_chance: (state, rng) -> next state, for any *mid-game* chance
@@ -118,11 +168,17 @@ class MCCFRTrainer:
         plus:          alias for variant="plus", kept for backwards compatibility.
         alpha, beta, gamma: DCFR discount exponents (positive regret, negative
                        regret, average strategy). Ignored unless variant="dcfr".
+        backend:       "auto" (default) uses the native Leduc loop when it is
+                       built and the hooks match standard Leduc, else Python.
+                       "python" forces the pure-Python loop; "rust" requires the
+                       native one and raises if it is unusable.
         """
         if variant is None:
             variant = "plus" if plus else "plain"
         if variant not in VARIANTS:
             raise ValueError(f"variant must be one of {VARIANTS}, got {variant!r}")
+        if backend not in ("auto", "python", "rust"):
+            raise ValueError(f"backend must be auto/python/rust, got {backend!r}")
         self.sample_root = sample_root
         self.sample_chance = sample_chance
         self.rng = random.Random(seed)
@@ -134,7 +190,63 @@ class MCCFRTrainer:
         self._cum_log_pos = array("d", [0.0])
         self._cum_log_neg = array("d", [0.0])
         self.iteration = 0  # total iterations trained so far, across train() calls
-        self.nodes = {}  # info_set_key -> InfoSetNode
+        self._nodes = {}  # info_set_key -> InfoSetNode
+        self._nodes_stale = False
+        self._rs = self._make_native(backend)
+        self.backend = "rust" if self._rs is not None else "python"
+
+    def _make_native(self, backend):
+        """The native trainer if it may be used here, else None."""
+        if backend == "python":
+            return None
+        # Subclasses change the traversal (see OutcomeSamplingTrainer), so the
+        # native external-sampling loop is not a valid substitute for them.
+        usable = (_rs is not None
+                  and type(self) is MCCFRTrainer
+                  and _is_standard_leduc(self.sample_root, self.sample_chance))
+        if not usable:
+            if backend == "rust":
+                if _rs is None:
+                    raise RuntimeError("backend='rust' but mccfr_rs is not built; "
+                                       "run ./build_rust.sh")
+                raise RuntimeError("backend='rust' only supports standard Leduc with "
+                                   "MCCFRTrainer; use backend='python'")
+            return None
+        return _rs.LeducTrainer(_VARIANT_CODES[self.variant],
+                                self.alpha, self.beta, self.gamma)
+
+    @property
+    def nodes(self):
+        """info_set_key -> InfoSetNode. Materialized from the native trainer on
+        demand when the native backend is in use."""
+        if self._nodes_stale:
+            self._sync_from_native()
+        return self._nodes
+
+    @nodes.setter
+    def nodes(self, value):
+        self._nodes = value
+        self._nodes_stale = False
+
+    def _sync_from_native(self):
+        for key, actions, regret, strategy_sum, synced in self._rs.export():
+            node = self._nodes.get(key)
+            if node is None:
+                node = InfoSetNode(list(actions))
+                self._nodes[key] = node
+            node.regret_sum = list(regret)
+            node.strategy_sum = list(strategy_sum)
+            node.synced = synced
+        self._nodes_stale = False
+
+    def _train_native(self, iterations):
+        """Hand the RNG to the native loop, run, and take the stream back so
+        self.rng stays usable and continuous for callers."""
+        self._rs.set_rng_state(list(self.rng.getstate()[1]))
+        self._rs.train(iterations)
+        self.rng.setstate((3, tuple(self._rs.rng_state()), None))
+        self.iteration = self._rs.iteration
+        self._nodes_stale = True
 
     # ---- Discounted CFR support ----
 
@@ -186,10 +298,10 @@ class MCCFRTrainer:
             return self._traverse(state, traversing_player, t)
 
         key = state.info_set_key()
-        node = self.nodes.get(key)
+        node = self._nodes.get(key)
         if node is None:
             node = InfoSetNode(state.legal_actions())
-            self.nodes[key] = node
+            self._nodes[key] = node
 
         regret = node.regret_sum
         strategy = _regret_matching(regret)
@@ -238,6 +350,22 @@ class MCCFRTrainer:
         across calls, so calling train() twice is equivalent to one longer
         call (this matters for CFR+'s linear weighting).
         """
+        if self._rs is not None:
+            # Same loop, run natively. Chunked so that on_report still fires on
+            # exactly the same iterations as the Python path.
+            local_t, remaining = 0, iterations
+            while remaining > 0:
+                if report_every and on_report is not None:
+                    step = min(report_every - (local_t % report_every), remaining)
+                else:
+                    step = remaining
+                self._train_native(step)
+                local_t += step
+                remaining -= step
+                if report_every and on_report is not None and local_t % report_every == 0:
+                    on_report(local_t)
+            return
+
         for local_t in range(1, iterations + 1):
             self.iteration += 1
             t = self.iteration
@@ -327,10 +455,10 @@ class OutcomeSamplingTrainer(MCCFRTrainer):
                                         my_reach, opp_reach, sample_reach)
 
         key = state.info_set_key()
-        node = self.nodes.get(key)
+        node = self._nodes.get(key)
         if node is None:
             node = InfoSetNode(state.legal_actions())
-            self.nodes[key] = node
+            self._nodes[key] = node
 
         regret = node.regret_sum
         strategy = _regret_matching(regret)
