@@ -141,6 +141,75 @@ def test_leduc_cfr_plus_beats_plain_mccfr():
 
 
 # ---------------------------------------------------------------------------
+# Discounted CFR
+# ---------------------------------------------------------------------------
+
+def test_dcfr_lazy_discount_matches_per_iteration_product():
+    """The O(1) lazy sync must equal applying every skipped iteration's
+    discount one at a time."""
+    import math
+    from mccfr import InfoSetNode
+    trainer = MCCFRTrainer(sample_root=kuhn.KuhnState.sample_root, variant="dcfr",
+                           alpha=1.5, beta=0.0, gamma=2.0)
+    for t in range(1, 8):
+        trainer._push_discount(t)
+    node = InfoSetNode(["p", "b"])
+    node.regret_sum = [3.0, -2.0]
+    node.strategy_sum = [5.0, 7.0]
+    node.synced = 2          # discounts for iterations 1 and 2 already applied
+    trainer._discount_node(node, 7)  # apply iterations 3..6
+
+    pos = neg = strat = 1.0
+    for s in range(3, 7):
+        pos *= s ** 1.5 / (s ** 1.5 + 1)
+        neg *= s ** 0.0 / (s ** 0.0 + 1)   # = 0.5 each
+        strat *= (s / (s + 1)) ** 2.0
+    assert math.isclose(node.regret_sum[0], 3.0 * pos, rel_tol=1e-12)
+    assert math.isclose(node.regret_sum[1], -2.0 * neg, rel_tol=1e-12)
+    assert math.isclose(node.strategy_sum[0], 5.0 * strat, rel_tol=1e-12)
+    assert math.isclose(node.strategy_sum[1], 7.0 * strat, rel_tol=1e-12)
+    assert node.synced == 6
+    # a second call with nothing new to apply is a no-op
+    before = list(node.regret_sum)
+    trainer._discount_node(node, 7)
+    assert node.regret_sum == before
+
+
+def test_dcfr_kuhn_converges_to_known_game_value():
+    trainer = MCCFRTrainer(sample_root=kuhn.KuhnState.sample_root, seed=42, variant="dcfr")
+    trainer.train(150_000)
+    expl, br0, br1 = exploitability(kuhn.KuhnState.enumerate_deals,
+                                    trainer.average_strategy_table())
+    assert abs(br0 - (-1 / 18)) < 0.02
+    assert abs(br1 - (1 / 18)) < 0.02
+    assert expl < 0.02
+
+
+def test_dcfr_beats_plain_on_leduc():
+    def make(variant):
+        return MCCFRTrainer(sample_root=leduc.LeducState.sample_root,
+                            sample_chance=lambda s, rng: s.deal_public_sample(rng),
+                            seed=11, variant=variant)
+    results = {}
+    for variant in ("plain", "dcfr"):
+        trainer = make(variant)
+        trainer.train(60_000)
+        results[variant], _, _ = exploitability(leduc.LeducState.enumerate_deals,
+                                                trainer.average_strategy_table())
+    assert results["dcfr"] < results["plain"]
+
+
+def test_variant_aliases_and_validation():
+    import pytest
+    assert MCCFRTrainer(sample_root=kuhn.KuhnState.sample_root).variant == "plain"
+    assert MCCFRTrainer(sample_root=kuhn.KuhnState.sample_root, plus=True).variant == "plus"
+    assert OutcomeSamplingTrainer(sample_root=kuhn.KuhnState.sample_root,
+                                  variant="dcfr").variant == "dcfr"
+    with pytest.raises(ValueError):
+        MCCFRTrainer(sample_root=kuhn.KuhnState.sample_root, variant="bogus")
+
+
+# ---------------------------------------------------------------------------
 # Outcome-sampling MCCFR
 # ---------------------------------------------------------------------------
 

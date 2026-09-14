@@ -8,6 +8,7 @@ Usage:
     python3 train.py leduc  --iterations 500000 --plus --save leduc.json
     python3 strategy.py leduc.json                        # readable chart
     python3 train.py kuhn   --sampler outcome             # outcome sampling
+    python3 train.py leduc  --variant dcfr                # Discounted CFR
 """
 import argparse
 import time
@@ -19,17 +20,24 @@ from exploitability import exploitability
 from strategy import save_strategy
 
 SAMPLERS = {"external": MCCFRTrainer, "outcome": OutcomeSamplingTrainer}
+VARIANTS = ("plain", "plus", "dcfr")
+_VARIANT_SUFFIX = {"plain": "", "plus": "+", "dcfr": "-dcfr"}
 
 
-def _tag(game, plus, sampler):
-    tag = game + ("+" if plus else "")
+def _tag(game, variant, sampler):
+    tag = game + _VARIANT_SUFFIX[variant]
     return tag if sampler == "external" else f"{tag}/{sampler}"
 
 
-def run_kuhn(iterations, report_every, seed, plus=False, sampler="external"):
-    trainer = SAMPLERS[sampler](sample_root=kuhn.KuhnState.sample_root, seed=seed, plus=plus)
+def _variant(plus, variant):
+    return variant or ("plus" if plus else "plain")
+
+
+def run_kuhn(iterations, report_every, seed, plus=False, sampler="external", variant=None):
+    variant = _variant(plus, variant)
+    trainer = SAMPLERS[sampler](sample_root=kuhn.KuhnState.sample_root, seed=seed, variant=variant)
     t0 = time.time()
-    tag = _tag("kuhn", plus, sampler)
+    tag = _tag("kuhn", variant, sampler)
 
     def report(t):
         table = trainer.average_strategy_table()
@@ -50,14 +58,16 @@ def run_kuhn(iterations, report_every, seed, plus=False, sampler="external"):
     return table, expl
 
 
-def run_leduc(iterations, report_every, seed, plus=False, sampler="external"):
+def run_leduc(iterations, report_every, seed, plus=False, sampler="external", variant=None):
+    variant = _variant(plus, variant)
+
     def sample_chance(state, rng):
         return state.deal_public_sample(rng)
 
     trainer = SAMPLERS[sampler](sample_root=leduc.LeducState.sample_root,
-                                sample_chance=sample_chance, seed=seed, plus=plus)
+                                sample_chance=sample_chance, seed=seed, variant=variant)
     t0 = time.time()
-    tag = _tag("leduc", plus, sampler)
+    tag = _tag("leduc", variant, sampler)
 
     def report(t):
         table = trainer.average_strategy_table()
@@ -80,22 +90,27 @@ if __name__ == "__main__":
     parser.add_argument("--iterations", type=int, default=50000)
     parser.add_argument("--report-every", type=int, default=None)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--variant", choices=VARIANTS, default=None,
+                        help="update rule: plain regret matching (default), CFR+ (plus), "
+                             "or Discounted CFR (dcfr; alpha=1.5, beta=0, gamma=2)")
     parser.add_argument("--plus", action="store_true",
-                        help="use CFR+ (regret clipping + linear strategy averaging)")
+                        help="shorthand for --variant plus")
     parser.add_argument("--sampler", choices=sorted(SAMPLERS), default="external",
                         help="external sampling (default) or outcome sampling MCCFR")
     parser.add_argument("--save", metavar="PATH", default=None,
                         help="write the final average strategy to PATH as JSON")
     args = parser.parse_args()
+    if args.plus and args.variant not in (None, "plus"):
+        parser.error("--plus conflicts with --variant " + args.variant)
 
     report_every = args.report_every or max(1, args.iterations // 10)
 
     if args.game == "kuhn":
         table, _ = run_kuhn(args.iterations, report_every, args.seed,
-                            plus=args.plus, sampler=args.sampler)
+                            plus=args.plus, sampler=args.sampler, variant=args.variant)
     else:
         table, _ = run_leduc(args.iterations, report_every, args.seed,
-                             plus=args.plus, sampler=args.sampler)
+                             plus=args.plus, sampler=args.sampler, variant=args.variant)
 
     if args.save:
         save_strategy(table, args.save)

@@ -22,17 +22,39 @@ Two samplers are provided:
     OutcomeSamplingTrainer  outcome sampling (Section 4.1), one trajectory per
                             iteration with importance-weighted updates
 
-CFR+ (Tammelin, "Solving Large Imperfect Information Games Using CFR+",
-2014) is available via `MCCFRTrainer(plus=True)`. It makes two changes:
-    (a) cumulative regrets are clipped at zero after every update
-        (regret matching+), so an action that has been bad for a long
-        time can be re-activated quickly once it becomes good again;
-    (b) the average strategy is weighted linearly by the iteration number
-        (strategy_sum += t * sigma_t), which discounts the poor early
-        iterates and makes the average track the current strategy faster.
+Three update variants are available on both trainers via `variant=`:
+
+    "plain"  regret matching, uniform average (Zinkevich et al. 2007)
+    "plus"   CFR+ (Tammelin 2014): cumulative regrets are clipped at zero
+             after every update (regret matching+), and the average strategy
+             is weighted linearly by iteration (strategy_sum += t * sigma_t).
+             `plus=True` is an alias kept for backwards compatibility.
+    "dcfr"   Discounted CFR (Brown & Sandholm 2019): at the end of every
+             iteration t, positive cumulative regrets are multiplied by
+             t^a/(t^a+1), negative ones by t^b/(t^b+1), and the accumulated
+             average strategy by (t/(t+1))^g. Defaults a=1.5, b=0, g=2 are
+             the paper's recommendation. With b=0 negative regret halves
+             every iteration, which behaves much like CFR+'s clipping but
+             keeps a little memory; g=2 weights iteration t's contribution
+             to the average by roughly t^2.
+
+DCFR's discounts are defined per iteration over ALL info sets. Applying
+them eagerly would cost O(#info sets) per iteration, so they are applied
+lazily: each node remembers the iteration it was last synced to, and on
+its next visit the product of all skipped per-iteration factors is applied
+in O(1) using running cumulative logs (regrets) and the telescoping product
+prod_{s=k+1}^{t-1} (s/(s+1))^g = ((k+1)/t)^g (strategy sum). Between visits
+a node's regrets do not change sign, so the positive/negative factor is
+well defined. The average strategy is normalized per node, so a pending
+uniform strategy-sum discount never changes the reported table.
 """
+import math
 import random
+from array import array
+
 import numpy as np
+
+VARIANTS = ("plain", "plus", "dcfr")
 
 # Performance note
 # ----------------
@@ -61,13 +83,14 @@ def _regret_matching(regret_sum):
 
 
 class InfoSetNode:
-    __slots__ = ("actions", "regret_sum", "strategy_sum")
+    __slots__ = ("actions", "regret_sum", "strategy_sum", "synced")
 
     def __init__(self, actions):
         self.actions = actions
         n = len(actions)
         self.regret_sum = [0.0] * n    # cumulative counterfactual regret per action
         self.strategy_sum = [0.0] * n  # accumulated current-strategy weight per action
+        self.synced = 0                # DCFR: end-of-iteration discounts applied through this iteration
 
     def current_strategy(self):
         return np.array(_regret_matching(self.regret_sum))
@@ -83,22 +106,68 @@ class InfoSetNode:
 
 
 class MCCFRTrainer:
-    def __init__(self, sample_root, sample_chance=None, seed=0, plus=False):
+    def __init__(self, sample_root, sample_chance=None, seed=0, plus=False,
+                 variant=None, alpha=1.5, beta=0.0, gamma=2.0):
         """
         sample_root:   () -> initial game state (handles the initial deal)
         sample_chance: (state, rng) -> next state, for any *mid-game* chance
                        node (e.g. Leduc's public card). Not needed for games
                        whose only randomness is the initial deal (e.g. Kuhn).
-        plus:          use CFR+ updates (regret clipping at zero and
-                       linear iteration weighting of the average strategy).
-                       Default False gives plain external-sampling MCCFR.
+        variant:       "plain" (default), "plus" (CFR+) or "dcfr" (Discounted
+                       CFR). See the module docstring.
+        plus:          alias for variant="plus", kept for backwards compatibility.
+        alpha, beta, gamma: DCFR discount exponents (positive regret, negative
+                       regret, average strategy). Ignored unless variant="dcfr".
         """
+        if variant is None:
+            variant = "plus" if plus else "plain"
+        if variant not in VARIANTS:
+            raise ValueError(f"variant must be one of {VARIANTS}, got {variant!r}")
         self.sample_root = sample_root
         self.sample_chance = sample_chance
         self.rng = random.Random(seed)
-        self.plus = plus
+        self.variant = variant
+        self.plus = variant == "plus"
+        self._dcfr = variant == "dcfr"
+        self.alpha, self.beta, self.gamma = alpha, beta, gamma
+        # DCFR: cumulative log discount factors, index t = sum over iterations 1..t.
+        self._cum_log_pos = array("d", [0.0])
+        self._cum_log_neg = array("d", [0.0])
         self.iteration = 0  # total iterations trained so far, across train() calls
         self.nodes = {}  # info_set_key -> InfoSetNode
+
+    # ---- Discounted CFR support ----
+
+    def _push_discount(self, t):
+        """Record iteration t's DCFR discount factors (called once per iteration)."""
+        ta = t ** self.alpha
+        tb = t ** self.beta
+        self._cum_log_pos.append(self._cum_log_pos[-1] + math.log(ta / (ta + 1.0)))
+        self._cum_log_neg.append(self._cum_log_neg[-1] + math.log(tb / (tb + 1.0)))
+
+    def _discount_node(self, node, t):
+        """
+        Apply the end-of-iteration DCFR discounts for iterations
+        node.synced+1 .. t-1 to `node`, i.e. every discount that fell due
+        since its last visit. Call before adding iteration t's regrets.
+        """
+        k = node.synced
+        if k >= t - 1:
+            return
+        pos_f = math.exp(self._cum_log_pos[t - 1] - self._cum_log_pos[k])
+        neg_f = math.exp(self._cum_log_neg[t - 1] - self._cum_log_neg[k])
+        regret = node.regret_sum
+        for i in range(len(regret)):
+            r = regret[i]
+            if r > 0.0:
+                regret[i] = r * pos_f
+            elif r < 0.0:
+                regret[i] = r * neg_f
+        sf = ((k + 1) / t) ** self.gamma
+        ssum = node.strategy_sum
+        for i in range(len(ssum)):
+            ssum[i] *= sf
+        node.synced = t - 1
 
     def _traverse(self, state, traversing_player, t):
         """
@@ -139,6 +208,8 @@ class MCCFRTrainer:
                     # Linear averaging: later iterates count more.
                     ssum[i] += t * strategy[i]
             else:
+                if self._dcfr:
+                    self._discount_node(node, t)
                 for i in range(n):
                     regret[i] += action_utils[i] - node_util
                     ssum[i] += strategy[i]
@@ -170,6 +241,8 @@ class MCCFRTrainer:
         for local_t in range(1, iterations + 1):
             self.iteration += 1
             t = self.iteration
+            if self._dcfr:
+                self._push_discount(t)
             root = self.sample_root(self.rng)
             self._iterate(root, t)
             if report_every and local_t % report_every == 0 and on_report is not None:
@@ -219,8 +292,10 @@ class OutcomeSamplingTrainer(MCCFRTrainer):
     higher variance per iteration; each iteration is far cheaper, though.
     """
 
-    def __init__(self, sample_root, sample_chance=None, seed=0, plus=False, epsilon=0.6):
-        super().__init__(sample_root, sample_chance, seed, plus)
+    def __init__(self, sample_root, sample_chance=None, seed=0, plus=False, epsilon=0.6,
+                 variant=None, alpha=1.5, beta=0.0, gamma=2.0):
+        super().__init__(sample_root, sample_chance, seed, plus,
+                         variant=variant, alpha=alpha, beta=beta, gamma=gamma)
         if not 0.0 < epsilon <= 1.0:
             raise ValueError("epsilon must be in (0, 1]")
         self.epsilon = epsilon
@@ -293,6 +368,8 @@ class OutcomeSamplingTrainer(MCCFRTrainer):
             avg_weight = my_reach / sample_reach
             if self.plus:
                 avg_weight *= t
+            elif self._dcfr:
+                self._discount_node(node, t)
             for i in range(n):
                 delta = (cf_action_value if i == a_idx else 0.0) - cf_value
                 if self.plus:

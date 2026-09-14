@@ -96,7 +96,7 @@ Leduc keys are `<private>|<public or ->|<round0 history>/<round1 history>` with 
 The code is the minimum that is correct and verifiable. The path to a real solver runs through, roughly in this order:
 
 - CFR+ (Tammelin, 2014): clip negative regret to zero after each update and weight the average strategy linearly by iteration. Converges dramatically faster in practice and is what every modern solver uses. It's a five-line change to `InfoSetNode`.
-- Linear / Discounted CFR (Brown & Sandholm, 2019): same idea, tuned discounting schedules.
+- Linear / Discounted CFR (Brown & Sandholm, 2019): same idea, tuned discounting schedules. Implemented as `variant="dcfr"`; see the convergence plot in the README for how it compares to CFR+ on Leduc.
 - Card abstraction: in real Hold'em you bucket the ~10^6 possible hand-board combinations into a few thousand strategically similar clusters, then solve the abstract game.
 - Action abstraction: discretize bet sizes (e.g. 0.5x, 1x, 2x pot, all-in). This is what commercial no-limit solvers do.
 - Deep CFR (Brown et al., 2019): replace the regret tables with neural networks so you don't need explicit abstraction.
