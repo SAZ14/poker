@@ -18,6 +18,7 @@ import leduc
 from mccfr import MCCFRTrainer
 from exploitability import exploitability, best_response_value
 from strategy import save_strategy, load_strategy, leduc_summary, parse_leduc_key
+import play
 
 
 # ---------------------------------------------------------------------------
@@ -186,6 +187,58 @@ def test_leduc_summary_names_actions_by_situation():
     assert "25.0%   75.0%       -       -       -" in opening
     assert parse_leduc_key("2|1|rc/cr") == (2, 1, "rc", "cr")
     assert parse_leduc_key("0|-|c/") == (0, None, "c", "")
+
+
+# ---------------------------------------------------------------------------
+# Interactive play (scripted input)
+# ---------------------------------------------------------------------------
+
+def _scripted(answers):
+    it = iter(answers)
+    return lambda prompt: next(it, "q")
+
+
+def test_play_session_scripted_calls_and_folds():
+    """Play scripted hands against a partially trained bot: seats alternate,
+    chip accounting matches the per-hand results, and quitting stops cleanly."""
+    import io
+    trainer = MCCFRTrainer(sample_root=leduc.LeducState.sample_root,
+                           sample_chance=lambda s, rng: s.deal_public_sample(rng),
+                           seed=2, plus=True)
+    trainer.train(5_000)
+    table = trainer.average_strategy_table()
+
+    out = io.StringIO()
+    # always call/check: every hand reaches a terminal state without folding
+    hands, total = play.play_session(table, random.Random(9), _scripted(["c"] * 200), out,
+                                     max_hands=6)
+    text = out.getvalue()
+    assert hands == 6
+    assert "You are player 0" in text and "You are player 1" in text
+    assert text.count("=== Hand ") == 6
+    assert "Quitting" not in text
+    # the per-hand lines sum to the running total
+    per_hand = [float(s.split()[2]) * (1 if "win" in s else -1)
+                for s in text.splitlines() if "You win" in s or "You lose" in s]
+    assert abs(sum(per_hand) - total) < 1e-9
+
+    # illegal input is rejected, fold ends the hand, q quits
+    out = io.StringIO()
+    hands, total = play.play_session(table, random.Random(9), _scripted(["x", "f", "q"]), out)
+    text = out.getvalue()
+    assert "Not a legal action" in text or "You fold" in text
+    assert "Quitting" in text
+    assert hands <= 1
+
+
+def test_bot_action_samples_from_table():
+    rng = random.Random(0)
+    root = leduc.LeducState.sample_root(rng)
+    key = root.info_set_key()
+    table = {key: {"c": 0.0, "r": 1.0}}
+    assert all(play.bot_action(table, root, rng) == "r" for _ in range(50))
+    # missing info set falls back to a legal action
+    assert play.bot_action({}, root, rng) in root.legal_actions()
 
 
 def test_uniform_random_strategy_is_far_from_equilibrium():
