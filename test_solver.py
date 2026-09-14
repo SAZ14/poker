@@ -15,7 +15,7 @@ import random
 
 import kuhn
 import leduc
-from mccfr import MCCFRTrainer
+from mccfr import MCCFRTrainer, OutcomeSamplingTrainer
 from exploitability import exploitability, best_response_value
 from strategy import save_strategy, load_strategy, leduc_summary, parse_leduc_key
 import play
@@ -138,6 +138,50 @@ def test_leduc_cfr_plus_beats_plain_mccfr():
         results[plus], _, _ = exploitability(leduc.LeducState.enumerate_deals, table)
 
     assert results[True] < results[False]
+
+
+# ---------------------------------------------------------------------------
+# Outcome-sampling MCCFR
+# ---------------------------------------------------------------------------
+
+def test_outcome_sampling_kuhn_converges_to_known_game_value():
+    trainer = OutcomeSamplingTrainer(sample_root=kuhn.KuhnState.sample_root, seed=42)
+    trainer.train(300_000)
+    table = trainer.average_strategy_table()
+
+    expl, br0, br1 = exploitability(kuhn.KuhnState.enumerate_deals, table)
+
+    assert abs(br0 - (-1 / 18)) < 0.03
+    assert abs(br1 - (1 / 18)) < 0.03
+    assert expl < 0.03
+
+
+def test_outcome_sampling_visits_every_kuhn_info_set_and_improves():
+    """Epsilon-greedy exploration must reach all 12 Kuhn info sets, and the
+    importance-weighted updates must actually reduce exploitability."""
+    trainer = OutcomeSamplingTrainer(sample_root=kuhn.KuhnState.sample_root, seed=8)
+    trainer.train(3_000)
+    assert len(trainer.nodes) == 12
+    expl_early, _, _ = exploitability(kuhn.KuhnState.enumerate_deals,
+                                      trainer.average_strategy_table())
+    trainer.train(150_000)
+    expl_late, _, _ = exploitability(kuhn.KuhnState.enumerate_deals,
+                                     trainer.average_strategy_table())
+    assert expl_late < expl_early * 0.5
+
+
+def test_outcome_sampling_leduc_makes_progress():
+    trainer = OutcomeSamplingTrainer(sample_root=leduc.LeducState.sample_root,
+                                     sample_chance=lambda s, rng: s.deal_public_sample(rng),
+                                     seed=3)
+    trainer.train(10_000)
+    expl_early, _, _ = exploitability(leduc.LeducState.enumerate_deals,
+                                      trainer.average_strategy_table())
+    trainer.train(300_000)
+    expl_late, _, _ = exploitability(leduc.LeducState.enumerate_deals,
+                                     trainer.average_strategy_table())
+    assert len(trainer.nodes) == 288
+    assert expl_late < expl_early * 0.75
 
 
 def test_leduc_king_rarely_folds_preflop_facing_bet():

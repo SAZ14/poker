@@ -42,6 +42,8 @@ The word "external" refers to everything outside player `i`'s control being samp
 
 The cost is variance. External sampling needs more iterations than vanilla CFR to reach the same exploitability, but each iteration is far cheaper, and the trade is enormously in its favor for large games.
 
+`OutcomeSamplingTrainer` in `mccfr.py` implements the other classic scheme from the same paper, outcome sampling: one full trajectory per iteration, with the traversing player sampling from an ε-greedy mixture (ε = 0.6) so every action keeps positive probability. Because only one action is explored at each of the traversing player's nodes, the sampled counterfactual values must be divided by the probability of having sampled that trajectory, which is the importance-weighting term external sampling avoids. Each iteration is cheaper still (a single path instead of a subtree) but the estimates are much noisier, so it needs more iterations per unit of exploitability; run `train.py --sampler outcome` to compare.
+
 ## 4. Reading `mccfr.py`
 
 `InfoSetNode` holds two vectors per information set: `regret_sum` (cumulative counterfactual regret per action) and `strategy_sum` (accumulated current-strategy probabilities, for the average).

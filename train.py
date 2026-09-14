@@ -7,21 +7,29 @@ Usage:
     python3 train.py leduc  --iterations 200000 --plus   # CFR+ updates
     python3 train.py leduc  --iterations 500000 --plus --save leduc.json
     python3 strategy.py leduc.json                        # readable chart
+    python3 train.py kuhn   --sampler outcome             # outcome sampling
 """
 import argparse
 import time
 
 import kuhn
 import leduc
-from mccfr import MCCFRTrainer
+from mccfr import MCCFRTrainer, OutcomeSamplingTrainer
 from exploitability import exploitability
 from strategy import save_strategy
 
+SAMPLERS = {"external": MCCFRTrainer, "outcome": OutcomeSamplingTrainer}
 
-def run_kuhn(iterations, report_every, seed, plus=False):
-    trainer = MCCFRTrainer(sample_root=kuhn.KuhnState.sample_root, seed=seed, plus=plus)
+
+def _tag(game, plus, sampler):
+    tag = game + ("+" if plus else "")
+    return tag if sampler == "external" else f"{tag}/{sampler}"
+
+
+def run_kuhn(iterations, report_every, seed, plus=False, sampler="external"):
+    trainer = SAMPLERS[sampler](sample_root=kuhn.KuhnState.sample_root, seed=seed, plus=plus)
     t0 = time.time()
-    tag = "kuhn+" if plus else "kuhn"
+    tag = _tag("kuhn", plus, sampler)
 
     def report(t):
         table = trainer.average_strategy_table()
@@ -42,14 +50,14 @@ def run_kuhn(iterations, report_every, seed, plus=False):
     return table, expl
 
 
-def run_leduc(iterations, report_every, seed, plus=False):
+def run_leduc(iterations, report_every, seed, plus=False, sampler="external"):
     def sample_chance(state, rng):
         return state.deal_public_sample(rng)
 
-    trainer = MCCFRTrainer(sample_root=leduc.LeducState.sample_root,
-                            sample_chance=sample_chance, seed=seed, plus=plus)
+    trainer = SAMPLERS[sampler](sample_root=leduc.LeducState.sample_root,
+                                sample_chance=sample_chance, seed=seed, plus=plus)
     t0 = time.time()
-    tag = "leduc+" if plus else "leduc"
+    tag = _tag("leduc", plus, sampler)
 
     def report(t):
         table = trainer.average_strategy_table()
@@ -74,6 +82,8 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--plus", action="store_true",
                         help="use CFR+ (regret clipping + linear strategy averaging)")
+    parser.add_argument("--sampler", choices=sorted(SAMPLERS), default="external",
+                        help="external sampling (default) or outcome sampling MCCFR")
     parser.add_argument("--save", metavar="PATH", default=None,
                         help="write the final average strategy to PATH as JSON")
     args = parser.parse_args()
@@ -81,9 +91,11 @@ if __name__ == "__main__":
     report_every = args.report_every or max(1, args.iterations // 10)
 
     if args.game == "kuhn":
-        table, _ = run_kuhn(args.iterations, report_every, args.seed, plus=args.plus)
+        table, _ = run_kuhn(args.iterations, report_every, args.seed,
+                            plus=args.plus, sampler=args.sampler)
     else:
-        table, _ = run_leduc(args.iterations, report_every, args.seed, plus=args.plus)
+        table, _ = run_leduc(args.iterations, report_every, args.seed,
+                             plus=args.plus, sampler=args.sampler)
 
     if args.save:
         save_strategy(table, args.save)

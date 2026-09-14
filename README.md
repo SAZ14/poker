@@ -11,6 +11,7 @@ pip install -r requirements.txt
 python3 train.py kuhn  --iterations 300000
 python3 train.py leduc --iterations 300000
 python3 train.py leduc --iterations 300000 --plus   # CFR+ (Tammelin 2014)
+python3 train.py kuhn  --sampler outcome            # outcome-sampling MCCFR
 python3 train.py leduc --iterations 500000 --plus --save leduc.json
 python3 strategy.py leduc.json                      # readable poker chart
 python3 play.py --strategy leduc.json               # play heads-up against it
@@ -23,7 +24,7 @@ Kuhn converges to the known Nash value of -1/18 for player 0 in a few seconds.
 
 | File | What it is |
 |---|---|
-| `mccfr.py` | Game-agnostic external-sampling MCCFR trainer and regret-matching info-set nodes |
+| `mccfr.py` | Game-agnostic MCCFR trainers (external sampling, outcome sampling) and regret-matching info-set nodes |
 | `kuhn.py` | Kuhn poker game tree (3 cards, one betting round) |
 | `leduc.py` | Leduc Hold'em game tree (6 cards, two rounds, public card, raise cap) |
 | `exploitability.py` | Exact best-response computation; the convergence metric |

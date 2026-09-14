@@ -17,6 +17,11 @@ Regret matching, average-strategy accumulation, and the external-sampling
 traversal are all game-agnostic; only the tree itself (kuhn.py / leduc.py)
 and how to sample a chance node are game-specific.
 
+Two samplers are provided:
+    MCCFRTrainer            external sampling (Section 4.2 of Lanctot et al.)
+    OutcomeSamplingTrainer  outcome sampling (Section 4.1), one trajectory per
+                            iteration with importance-weighted updates
+
 CFR+ (Tammelin, "Solving Large Imperfect Information Games Using CFR+",
 2014) is available via `MCCFRTrainer(plus=True)`. It makes two changes:
     (a) cumulative regrets are clipped at zero after every update
@@ -166,10 +171,14 @@ class MCCFRTrainer:
             self.iteration += 1
             t = self.iteration
             root = self.sample_root(self.rng)
-            for player in (0, 1):
-                self._traverse(root, player, t)
+            self._iterate(root, t)
             if report_every and local_t % report_every == 0 and on_report is not None:
                 on_report(local_t)
+
+    def _iterate(self, root, t):
+        """One iteration from a freshly dealt root: a traversal per player."""
+        for player in (0, 1):
+            self._traverse(root, player, t)
 
     def average_strategy_table(self):
         """key -> {action: probability}"""
@@ -178,3 +187,124 @@ class MCCFRTrainer:
             avg = node.average_strategy()
             table[key] = {a: float(p) for a, p in zip(node.actions, avg)}
         return table
+
+
+class OutcomeSamplingTrainer(MCCFRTrainer):
+    """
+    Outcome-sampling MCCFR (Lanctot et al. 2009, Section 4.1).
+
+    Each iteration samples ONE terminal history per player instead of
+    expanding every action at the traversing player's nodes. Actions are
+    drawn from a sampling policy sigma': the traversing player uses an
+    epsilon-greedy mixture, sigma'(I,a) = eps/|A(I)| + (1-eps) sigma(I,a),
+    so every action keeps positive probability (needed for the estimator to
+    be unbiased); the opponent and chance are sampled on-policy.
+
+    Because only one trajectory is seen, the counterfactual values must be
+    importance-corrected by the probability of having sampled it. With z the
+    sampled terminal history, h the prefix in info set I (player i to act),
+    and q(.) the sampling probability under sigma',
+
+        v~(I, a) = u_i(z) * pi_{-i}(h) * pi^sigma(ha -> z) / q(z)   if a is on z
+                 = 0                                              otherwise
+        v~(I)    = sigma(I, a_sampled) * v~(I, a_sampled)
+
+    and the regret update is r(I,a) += v~(I,a) - v~(I). The average strategy
+    is accumulated as pi_i(h) sigma(I,a) / q(h) so that it too is unbiased.
+    Chance probabilities appear in both pi_{-i} and q and cancel, so they are
+    omitted from both. This is the same estimator as OpenSpiel's
+    outcome-sampling solver with a zero baseline.
+
+    Convergence is O(1/sqrt(T)) like external sampling, but with much
+    higher variance per iteration; each iteration is far cheaper, though.
+    """
+
+    def __init__(self, sample_root, sample_chance=None, seed=0, plus=False, epsilon=0.6):
+        super().__init__(sample_root, sample_chance, seed, plus)
+        if not 0.0 < epsilon <= 1.0:
+            raise ValueError("epsilon must be in (0, 1]")
+        self.epsilon = epsilon
+
+    def _iterate(self, root, t):
+        for player in (0, 1):
+            self._sample_episode(root, player, t, 1.0, 1.0, 1.0)
+
+    def _sample_episode(self, state, traversing_player, t, my_reach, opp_reach, sample_reach):
+        """
+        Walk one sampled trajectory from `state` to a terminal.
+
+        my_reach:     pi_i(h)   traversing player's own reach under sigma
+        opp_reach:    pi_{-i}(h) opponent's reach under sigma (chance omitted)
+        sample_reach: q(h)      probability of having sampled the path to h
+
+        Returns u_i(z) * pi^sigma(h -> z) / q(h -> z): the sampled utility
+        of `state`, importance-corrected for the tail of the trajectory below
+        it. Regrets and average strategy are updated at the traversing
+        player's nodes on the way back up.
+        """
+        if state.is_terminal():
+            return state.utility(traversing_player)
+
+        player = state.current_player()
+        if player == "CHANCE":
+            state = self.sample_chance(state, self.rng)
+            return self._sample_episode(state, traversing_player, t,
+                                        my_reach, opp_reach, sample_reach)
+
+        key = state.info_set_key()
+        node = self.nodes.get(key)
+        if node is None:
+            node = InfoSetNode(state.legal_actions())
+            self.nodes[key] = node
+
+        regret = node.regret_sum
+        strategy = _regret_matching(regret)
+        n = len(strategy)
+
+        # Sampling policy: epsilon-greedy for the traversing player, on-policy otherwise.
+        if player == traversing_player:
+            eps = self.epsilon
+            uniform = eps / n
+            sample_policy = [uniform + (1.0 - eps) * p for p in strategy]
+        else:
+            sample_policy = strategy
+
+        # Draw one action from the sampling policy.
+        r = self.rng.random()
+        acc = 0.0
+        a_idx = n - 1
+        for i in range(n):
+            acc += sample_policy[i]
+            if r < acc:
+                a_idx = i
+                break
+        a = node.actions[a_idx]
+        sigma_a = strategy[a_idx]
+        q_a = sample_policy[a_idx]
+
+        if player == traversing_player:
+            child_value = self._sample_episode(state.next_state(a), traversing_player, t,
+                                               my_reach * sigma_a, opp_reach, sample_reach * q_a)
+            # Importance-corrected sampled counterfactual value of the taken
+            # action; every other action's sampled value is zero.
+            cf_action_value = child_value / q_a * opp_reach / sample_reach
+            cf_value = sigma_a * cf_action_value
+            ssum = node.strategy_sum
+            avg_weight = my_reach / sample_reach
+            if self.plus:
+                avg_weight *= t
+            for i in range(n):
+                delta = (cf_action_value if i == a_idx else 0.0) - cf_value
+                if self.plus:
+                    v = regret[i] + delta
+                    regret[i] = v if v >= 0.0 else 0.0
+                else:
+                    regret[i] += delta
+                ssum[i] += avg_weight * strategy[i]
+        else:
+            child_value = self._sample_episode(state.next_state(a), traversing_player, t,
+                                               my_reach, opp_reach * sigma_a, sample_reach * q_a)
+
+        # Estimated value of this state: sigma(a) * child / sigma'(a), which
+        # telescopes to u_i(z) pi^sigma(h -> z) / q(h -> z) up the trajectory.
+        return sigma_a * child_value / q_a
