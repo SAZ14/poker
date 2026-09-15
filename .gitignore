@@ -1,3 +1,7 @@
 __pycache__/
 .pytest_cache/
 *.pyc
+
+# Built Rust acceleration module (see build_rust.sh)
+rust/target/
+*.so

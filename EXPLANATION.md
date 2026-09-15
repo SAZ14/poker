@@ -42,6 +42,8 @@ The word "external" refers to everything outside player `i`'s control being samp
 
 The cost is variance. External sampling needs more iterations than vanilla CFR to reach the same exploitability, but each iteration is far cheaper, and the trade is enormously in its favor for large games.
 
+`OutcomeSamplingTrainer` in `mccfr.py` implements the other classic scheme from the same paper, outcome sampling: one full trajectory per iteration, with the traversing player sampling from an ε-greedy mixture (ε = 0.6) so every action keeps positive probability. Because only one action is explored at each of the traversing player's nodes, the sampled counterfactual values must be divided by the probability of having sampled that trajectory, which is the importance-weighting term external sampling avoids. Each iteration is cheaper still (a single path instead of a subtree) but the estimates are much noisier, so it needs more iterations per unit of exploitability; run `train.py --sampler outcome` to compare.
+
 ## 4. Reading `mccfr.py`
 
 `InfoSetNode` holds two vectors per information set: `regret_sum` (cumulative counterfactual regret per action) and `strategy_sum` (accumulated current-strategy probabilities, for the average).
@@ -53,6 +55,8 @@ The cost is variance. External sampling needs more iterations than vanilla CFR t
 - Traversing player's node: compute `action_utils[a]` for each `a` by recursing, take `node_util = σ · action_utils`, add `action_utils - node_util` to `regret_sum` (that's the instantaneous counterfactual regret), add `σ` to `strategy_sum`, return `node_util`.
 
 `train()` samples a fresh deal each iteration and runs `_traverse` once for each player. The game code is entirely decoupled: `mccfr.py` only needs `is_terminal`, `current_player`, `legal_actions`, `next_state`, `info_set_key`, and `utility`.
+
+`MCCFRTrainer(plus=True)` switches on CFR+ (Tammelin, 2014), which changes two lines of the traversing-player branch. After the regret update, `regret_sum` is clipped at zero elementwise (regret matching+), so an action that accumulated a large negative regret can come back into play as soon as it becomes good, instead of having to climb all the way back up. And the average strategy is accumulated as `strategy_sum += t * σ` rather than `strategy_sum += σ`, so the crude early iterates are down-weighted. Both are exact in the sense that the same convergence theorem still applies, and in practice CFR+ reaches a given exploitability in far fewer iterations. `_traverse` takes the iteration number `t` as a parameter for this reason.
 
 ## 5. Knowing whether it worked: exploitability
 
@@ -92,11 +96,11 @@ Leduc keys are `<private>|<public or ->|<round0 history>/<round1 history>` with 
 The code is the minimum that is correct and verifiable. The path to a real solver runs through, roughly in this order:
 
 - CFR+ (Tammelin, 2014): clip negative regret to zero after each update and weight the average strategy linearly by iteration. Converges dramatically faster in practice and is what every modern solver uses. It's a five-line change to `InfoSetNode`.
-- Linear / Discounted CFR (Brown & Sandholm, 2019): same idea, tuned discounting schedules.
+- Linear / Discounted CFR (Brown & Sandholm, 2019): same idea, tuned discounting schedules. Implemented as `variant="dcfr"`; see the convergence plot in the README for how it compares to CFR+ on Leduc.
 - Card abstraction: in real Hold'em you bucket the ~10^6 possible hand-board combinations into a few thousand strategically similar clusters, then solve the abstract game.
 - Action abstraction: discretize bet sizes (e.g. 0.5x, 1x, 2x pot, all-in). This is what commercial no-limit solvers do.
 - Deep CFR (Brown et al., 2019): replace the regret tables with neural networks so you don't need explicit abstraction.
-- Depth-limited solving and subgame re-solving (Libratus, Pluribus): solve the early streets offline, re-solve the later ones in real time given the actual board.
+- Depth-limited solving and subgame re-solving (Libratus, Pluribus): solve the early streets offline, re-solve the later ones in real time given the actual board. `resolve.py` implements the *unsafe* version for Leduc's flop and measures what it costs: it helps a weak blueprint a lot and makes a strong one several times worse, because a re-solve against a frozen opponent range has no defense against the opponent changing how they reach the subgame. That failure is the reason safe re-solving exists.
 
 ## References
 

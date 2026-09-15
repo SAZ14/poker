@@ -32,29 +32,74 @@ A round ends (without a fold) when a player calls, i.e. the round history
 is one of "cc", "rc", "crc", "rrc", "crrc".
 
 Info set key = f"{private_card}|{public_card_or_'-'}|{round0_hist}/{round1_hist}"
+
+Implementation notes
+--------------------
+States are immutable, so everything derivable from the constructor
+arguments (who acts, whether the state is terminal, the legal actions) is
+computed once in __init__ from the current round's history string and
+cached. `round_hists` and `contrib` are stored as tuples and shared between
+parent and child states rather than copied. `legal_actions()` returns a
+shared module-level list per history: treat it as read-only.
 """
 import itertools
 
 RANKS = 3          # J, Q, K
 COPIES = 2         # two of each rank
-BET_SIZE = [2, 4]  # round0, round1
+BET_SIZE = (2, 4)  # round0, round1
 RAISE_CAP = 2
 ANTE = 1
+
+# Round histories after which the betting round is over (last action a call).
+_ROUND_OVER = frozenset(("cc", "rc", "crc", "rrc", "crrc"))
+
+# Legal actions from every non-over round history. Facing no bet: check or
+# bet. Facing a bet/raise: call, fold, and raise only while under the cap.
+_LEGAL = {
+    "": ["c", "r"],
+    "c": ["c", "r"],
+    "r": ["c", "f", "r"],
+    "cr": ["c", "f", "r"],
+    "rr": ["c", "f"],
+    "crr": ["c", "f"],
+}
+_NO_ACTIONS = ()
 
 
 def _full_deck():
     return [r for r in range(RANKS) for _ in range(COPIES)]
 
 
+def legal_actions_for_round_history(h):
+    """Legal actions from a round history string. The returned list is shared
+    module state: treat it as read-only."""
+    return _LEGAL[h]
+
+
 class LeducState:
+    __slots__ = ("cards", "public", "round_idx", "round_hists", "contrib",
+                 "folded", "deck_remaining", "_h", "_player")
+
     def __init__(self, cards, public, round_idx, round_hists, contrib, folded, deck_remaining):
         self.cards = cards                    # (card_p0, card_p1)
         self.public = public                  # None until dealt
         self.round_idx = round_idx            # 0 or 1
-        self.round_hists = round_hists        # [hist_round0_str, hist_round1_str]
-        self.contrib = contrib                # [chips_in_by_p0, chips_in_by_p1]
+        self.round_hists = round_hists        # (hist_round0_str, hist_round1_str)
+        self.contrib = contrib                # (chips_in_by_p0, chips_in_by_p1)
         self.folded = folded                  # None or player index
         self.deck_remaining = deck_remaining  # tuple of cards left (for chance dealing)
+
+        # Derived, cached once: current round history and who acts.
+        # _player is None at terminal states, "CHANCE" when the public card
+        # is due, else 0 or 1 (player 0 acts first each round, alternating).
+        h = round_hists[round_idx]
+        self._h = h
+        if folded is not None:
+            self._player = None
+        elif h in _ROUND_OVER:
+            self._player = None if round_idx == 1 else "CHANCE"
+        else:
+            self._player = len(h) & 1
 
     # ---- chance / setup ----
     @staticmethod
@@ -62,7 +107,7 @@ class LeducState:
         deck = _full_deck()
         rng.shuffle(deck)
         c0, c1, *rest = deck
-        return LeducState((c0, c1), None, 0, ["", ""], [ANTE, ANTE], None, tuple(rest))
+        return LeducState((c0, c1), None, 0, ("", ""), (ANTE, ANTE), None, tuple(rest))
 
     @staticmethod
     def enumerate_deals():
@@ -82,77 +127,69 @@ class LeducState:
             remaining = list(full_deck)
             remaining.remove(c0)
             remaining.remove(c1)
-            state = LeducState((c0, c1), None, 0, ["", ""], [ANTE, ANTE], None, tuple(remaining))
+            state = LeducState((c0, c1), None, 0, ("", ""), (ANTE, ANTE), None, tuple(remaining))
             yield state, cnt / total
 
     def _round_hist(self):
-        return self.round_hists[self.round_idx]
+        return self._h
 
     def _num_raises(self):
-        return self._round_hist().count("r")
+        return self._h.count("r")
 
     def _facing_bet(self):
-        h = self._round_hist()
+        h = self._h
         return len(h) > 0 and h[-1] == "r"
 
     def _round_over(self):
-        h = self._round_hist()
-        return h in ("cc", "rc", "crc", "rrc", "crrc")
+        return self._h in _ROUND_OVER
 
     def _acting_player(self):
         # Player 0 acts first in every round; alternate afterward.
-        return len(self._round_hist()) % 2
+        return len(self._h) & 1
 
     # ---- tree structure ----
     def is_terminal(self):
-        if self.folded is not None:
-            return True
-        if self.round_idx == 1 and self._round_over():
-            return True
-        return False
+        return self._player is None
 
     def current_player(self):
-        if self.is_terminal():
-            return None
-        if self.round_idx == 0 and self._round_over():
-            return "CHANCE"  # need to deal the public card
-        return self._acting_player()
+        return self._player
 
     def legal_actions(self):
-        assert not self.is_terminal() and self.current_player() != "CHANCE"
-        h = self._round_hist()
-        if h == "" or h == "c":
-            return ["c", "r"]
-        # facing a bet/raise
-        actions = ["c", "f"]
-        if self._num_raises() < RAISE_CAP:
-            actions.append("r")
-        return actions
+        player = self._player
+        assert player is not None and player != "CHANCE"
+        return _LEGAL[self._h]
 
     def next_state(self, action):
-        assert action in self.legal_actions()
-        player = self._acting_player()
-        opp = 1 - player
-        contrib = list(self.contrib)
-        hists = list(self.round_hists)
-        bet_size = BET_SIZE[self.round_idx]
+        player = self._player
+        h = self._h
+        assert player is not None and player != "CHANCE" and action in _LEGAL[h]
+        round_idx = self.round_idx
 
         if action == "f":
-            return LeducState(self.cards, self.public, self.round_idx, hists,
-                               contrib, player, self.deck_remaining)
+            return LeducState(self.cards, self.public, round_idx, self.round_hists,
+                              self.contrib, player, self.deck_remaining)
 
+        contrib = self.contrib
         if action == "c":
-            if self._facing_bet():
-                contrib[player] = contrib[opp]  # call up to opponent's contribution
-            hists[self.round_idx] = hists[self.round_idx] + "c"
-        elif action == "r":
-            # raise/bet: put in enough to call (if facing a bet) plus one bet_size
-            to_call = max(0, contrib[opp] - contrib[player])
-            contrib[player] += to_call + bet_size
-            hists[self.round_idx] = hists[self.round_idx] + "r"
+            if h and h[-1] == "r":
+                # call up to opponent's contribution
+                contrib = (contrib[1], contrib[1]) if player == 0 else (contrib[0], contrib[0])
+        else:  # "r": put in enough to call (if facing a bet) plus one bet_size
+            opp = 1 - player
+            to_call = contrib[opp] - contrib[player]
+            if to_call < 0:
+                to_call = 0
+            new = contrib[player] + to_call + BET_SIZE[round_idx]
+            contrib = (new, contrib[1]) if player == 0 else (contrib[0], new)
 
-        return LeducState(self.cards, self.public, self.round_idx, hists,
-                           contrib, None, self.deck_remaining)
+        rh = self.round_hists
+        if round_idx == 0:
+            hists = (h + action, rh[1])
+        else:
+            hists = (rh[0], h + action)
+
+        return LeducState(self.cards, self.public, round_idx, hists,
+                          contrib, None, self.deck_remaining)
 
     def deal_public_chance_outcomes(self):
         """Used for exact best-response search: all possible public cards
@@ -170,25 +207,27 @@ class LeducState:
         return self.with_public(card)
 
     def with_public(self, card):
-        remaining = list(self.deck_remaining)
-        remaining.remove(card)
+        deck = self.deck_remaining
+        i = deck.index(card)
+        remaining = deck[:i] + deck[i + 1:]
         return LeducState(self.cards, card, 1, self.round_hists, self.contrib,
-                           None, tuple(remaining))
+                          None, remaining)
 
     def info_set_key(self):
-        player = self.current_player()
         pub = self.public if self.public is not None else "-"
-        return f"{self.cards[player]}|{pub}|{self.round_hists[0]}/{self.round_hists[1]}"
+        rh = self.round_hists
+        return f"{self.cards[self._player]}|{pub}|{rh[0]}/{rh[1]}"
 
     def utility(self, player):
-        assert self.is_terminal()
+        assert self._player is None
         opp = 1 - player
-        pot = self.contrib[0] + self.contrib[1]
+        contrib = self.contrib
+        pot = contrib[0] + contrib[1]
         if self.folded is not None:
             if self.folded == player:
-                return -self.contrib[player]
+                return -contrib[player]
             else:
-                return self.contrib[opp]
+                return contrib[opp]
         # showdown
         my_card, opp_card = self.cards[player], self.cards[opp]
         my_pair = (my_card == self.public)
@@ -202,7 +241,7 @@ class LeducState:
         else:
             # identical private ranks, neither pairs the board -> split pot
             return 0.0
-        return (pot - self.contrib[player]) if win else -self.contrib[player]
+        return (pot - contrib[player]) if win else -contrib[player]
 
 
 GAME_NAME = "leduc_poker"
